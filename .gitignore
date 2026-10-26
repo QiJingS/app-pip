@@ -1,0 +1,7 @@
+# scratch/intermediate outputs
+results/
+*.DS_Store
+.snakemake/
+results*/
+config/config.hcv.yaml
+RUN_CLUSTER.md

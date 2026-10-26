@@ -1,0 +1,239 @@
+# ============================================================================
+# app-pip : a scalable pipeline for multi-layer genetic characterisation
+#           of the antigen presentation pathway (APP)
+#
+# Inputs : (1) PHASED, imputed whole-genome genotypes (VCF/VCF.GZ, per chrom)
+#          (2) HLA allele calls (imputed or typed; VCF/VCF.GZ)
+# Output : a per-sample feature matrix spanning the APP, plus a feature
+#          dictionary and a QC summary.
+#
+# NOTE: all non-HLA input genotypes must be PHASED (GT separator "|").
+#       The pipeline stops with an error if unphased genotypes are found.
+# ============================================================================
+
+import os
+
+configfile: "config/config.yaml"
+
+# ---- optional schema validation (skipped gracefully if snakemake.utils absent)
+try:
+    from snakemake.utils import validate
+    validate(config, "../config/config.schema.yaml")
+except Exception as e:
+    print(f"[app-pip] config schema not validated ({e})")
+
+OUTDIR   = config["output_dir"].rstrip("/")
+RES      = config["resources"]
+BUILD    = str(config["build"])
+POSCOL   = "pos38" if BUILD == "38" else "pos37"
+DIGITS   = [str(d) for d in config["hla"]["resolution"]]
+HLAFACT  = config["hlafactor"]["binary"]
+MODULES  = config["hlafactor"]["modules"]
+
+WGS_VCF  = config["wgs"]["vcf"]            # pattern containing {chrom} or a single file
+CHROMS   = [str(c) for c in config["wgs"]["chroms"]]
+
+def wgs_inputs():
+    if "{chrom}" in WGS_VCF:
+        return expand(WGS_VCF, chrom=CHROMS)
+    return [WGS_VCF]
+
+rule all:
+    input:
+        f"{OUTDIR}/app_feature_matrix.tsv",
+        f"{OUTDIR}/feature_dictionary.tsv",
+        f"{OUTDIR}/qc_summary.txt"
+
+# ----------------------------------------------------------------------------
+# 1. Build target regions from the (versioned) variant reference table
+# ----------------------------------------------------------------------------
+rule make_regions:
+    input:
+        variants = RES["app_variants"]
+    output:
+        bed = f"{OUTDIR}/regions.bed"
+    params:
+        genes = config["target_genes"],
+        vep   = config.get("vep_annotation", []),
+        poscol = POSCOL,
+        flank = config["wgs"]["flank_bp"]
+    run:
+        import csv
+        genes = set(params.genes) if params.genes else None
+        vep   = set(params.vep) if params.vep else None
+        rows = []
+        with open(input.variants) as fh:
+            r = csv.DictReader(fh, delimiter="\t")
+            for row in r:
+                if genes and row["gene"] not in genes:
+                    continue
+                if vep and row["vep_annotation"] not in vep:
+                    continue
+                pos = row[params.poscol]
+                if not pos:
+                    continue
+                rows.append((row["chrom"], int(pos)))
+        # one BED interval per variant, extended by flank
+        os.makedirs(OUTDIR, exist_ok=True)
+        with open(output.bed, "w") as out:
+            for chrom, pos in sorted(set(rows)):
+                start = max(0, pos - 1 - params.flank)
+                end   = pos + params.flank
+                out.write(f"{chrom}\t{start}\t{end}\n")
+
+# ----------------------------------------------------------------------------
+# 2. Extract APP SNPs from the phased WGS VCF(s), then QC on MAF and R^2
+#    Region-based extraction (one pass per file) instead of per-SNP tabix.
+# ----------------------------------------------------------------------------
+rule extract_snps:
+    input:
+        vcf = wgs_inputs(),
+        bed = rules.make_regions.output.bed
+    output:
+        vcf = f"{OUTDIR}/app_snps.vcf.gz"
+    params:
+        maf = config["wgs"]["snp_maf"],
+        r2  = config["wgs"]["snp_r2"],
+        r2f = config["wgs"]["r2_info_field"]
+    benchmark:
+        f"{OUTDIR}/bench/extract_snps.tsv"
+    shell:
+        r"""
+        set -euo pipefail
+        tmp=$(mktemp -d)
+        for v in {input.vcf}; do
+            bcftools view -R {input.bed} "$v" -Ou >> "$tmp/parts.list" 2>/dev/null || true
+            bcftools view -R {input.bed} "$v" -Oz -o "$tmp/$(basename $v).sub.vcf.gz"
+            bcftools index -t "$tmp/$(basename $v).sub.vcf.gz"
+        done
+        bcftools concat -a "$tmp"/*.sub.vcf.gz -Oz -o "$tmp/merged.vcf.gz"
+        bcftools index -t "$tmp/merged.vcf.gz"
+        # MAF = min(AF, 1-AF); keep common, well-imputed variants
+        bcftools view -e 'INFO/{params.r2f} < {params.r2}' "$tmp/merged.vcf.gz" -Ou \
+          | bcftools view -i 'AF > {params.maf} && AF < (1 - {params.maf})' -Oz -o {output.vcf}
+        bcftools index -t {output.vcf}
+        rm -rf "$tmp"
+        """
+
+# ----------------------------------------------------------------------------
+# 3. Require phased genotypes. Error out (do not guess) on unphased input.
+# ----------------------------------------------------------------------------
+rule check_phased:
+    input:
+        vcf = rules.extract_snps.output.vcf
+    output:
+        ok = f"{OUTDIR}/.phased_ok"
+    shell:
+        r"""
+        set -euo pipefail
+        # Look for any unphased diploid call (contains "/") in the genotypes.
+        n_unphased=$(bcftools query -f '[%GT\n]' {input.vcf} \
+                     | grep -c '/' || true)
+        if [ "$n_unphased" -gt 0 ]; then
+            echo "ERROR: $n_unphased unphased genotype(s) found in {input.vcf}." >&2
+            echo "app-pip requires PHASED WGS input (GT separator '|')." >&2
+            echo "Please phase the input (e.g. with SHAPEIT or BEAGLE) and rerun." >&2
+            exit 1
+        fi
+        touch {output.ok}
+        """
+
+# ----------------------------------------------------------------------------
+# 4. Variant features: SNP dosages under the chosen genetic model
+# ----------------------------------------------------------------------------
+rule snp_features:
+    input:
+        vcf = rules.extract_snps.output.vcf,
+        ok  = rules.check_phased.output.ok
+    output:
+        tsv = f"{OUTDIR}/app_snp_features.tsv"
+    params:
+        model = config["genetic_model"]
+    benchmark:
+        f"{OUTDIR}/bench/snp_features.tsv"
+    script:
+        "scripts/snp_features.R"
+
+# ----------------------------------------------------------------------------
+# 5. Allotypes (R implementation) for genes with >=2 defining missense sites
+# ----------------------------------------------------------------------------
+rule allotypes:
+    input:
+        vcf = rules.extract_snps.output.vcf,
+        ok  = rules.check_phased.output.ok,
+        defs = RES["allotype_definitions"]
+    output:
+        tsv = f"{OUTDIR}/app_allotypes.tsv"
+    params:
+        build = BUILD,
+        min_freq = config["allotype_min_freq"]
+    benchmark:
+        f"{OUTDIR}/bench/allotypes.tsv"
+    script:
+        "scripts/allotype.R"
+
+# ----------------------------------------------------------------------------
+# 6. HLA region extraction + QC (configurable imputation-quality field)
+# ----------------------------------------------------------------------------
+rule extract_hla:
+    input:
+        vcf = config["hla"]["vcf"]
+    output:
+        vcf = f"{OUTDIR}/hla_qc.vcf.gz"
+    params:
+        region = ("6:28510120-33480577" if str(config["hla"]["build"]) == "38"
+                  else "6:28477797-33448354"),
+        maf = config["hla"]["maf"],
+        r2  = config["hla"]["r2"],
+        r2f = config["hla"]["r2_info_field"]
+    benchmark:
+        f"{OUTDIR}/bench/extract_hla.tsv"
+    shell:
+        r"""
+        set -euo pipefail
+        bcftools view -r {params.region} {input.vcf} -Ou \
+          | bcftools view -e 'INFO/{params.r2f} < {params.r2}' -Ou \
+          | bcftools view -i 'MAF > {params.maf}' -Oz -o {output.vcf}
+        bcftools index -t {output.vcf}
+        """
+
+# ----------------------------------------------------------------------------
+# 7. HLA functional features via hlafactor (one output per requested module)
+# ----------------------------------------------------------------------------
+rule hlafactor_module:
+    input:
+        vcf = rules.extract_hla.output.vcf
+    output:
+        done = f"{OUTDIR}/hlafactor/{{module}}.done"
+    params:
+        bin = HLAFACT,
+        outdir = f"{OUTDIR}/hlafactor"
+    benchmark:
+        f"{OUTDIR}/bench/hlafactor_{{module}}.tsv"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {params.outdir}
+        {params.bin} -i {input.vcf} -o {params.outdir}/{wildcards.module}.txt -{wildcards.module}
+        touch {output.done}
+        """
+
+# ----------------------------------------------------------------------------
+# 8. Combine every layer into the final per-sample feature matrix
+# ----------------------------------------------------------------------------
+rule combine:
+    input:
+        snps = rules.snp_features.output.tsv,
+        allo = rules.allotypes.output.tsv,
+        hla  = expand(f"{OUTDIR}/hlafactor/{{module}}.done", module=MODULES)
+    output:
+        matrix = f"{OUTDIR}/app_feature_matrix.tsv",
+        dict   = f"{OUTDIR}/feature_dictionary.tsv",
+        qc     = f"{OUTDIR}/qc_summary.txt"
+    params:
+        hladir = f"{OUTDIR}/hlafactor",
+        modules = MODULES
+    benchmark:
+        f"{OUTDIR}/bench/combine.tsv"
+    script:
+        "scripts/combine_matrix.R"

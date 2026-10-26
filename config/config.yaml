@@ -1,0 +1,53 @@
+# ============================================================================
+# app-pip configuration
+# Edit the paths and thresholds below, then run:
+#   snakemake --configfile config/config.yaml --cores 8
+# ============================================================================
+
+output_dir: "results"
+
+# Reference build for the WGS variants: "38" or "37"
+build: "38"
+
+# Versioned reference tables (shipped in resources/)
+resources:
+  app_variants: "resources/app_variants.tsv"
+  allotype_definitions: "resources/allotype_definitions.tsv"
+
+# Which APP genes to analyse. Leave empty ([]) to use every gene in the table.
+target_genes: ["PSMB8", "PSMB9", "TAP1", "TAP2", "ERAP1", "ERAP2",
+               "TAPBP", "CALR", "CANX", "ERp57", "PSMB5", "PSMB6",
+               "PSMB7", "PSMB10"]
+
+# Optional VEP consequence filter. Leave empty ([]) to keep all annotations.
+vep_annotation: []        # e.g. ["missense_variant", "synonymous_variant"]
+
+# Genetic model for SNP dosages: additive | dominant | recessive
+genetic_model: "additive"
+
+# Minimum allotype frequency to report (0 keeps all)
+allotype_min_freq: 0.0
+
+# ---- Phased, imputed whole-genome genotypes --------------------------------
+wgs:
+  # single file, or a pattern containing {chrom}
+  vcf: "/path/to/wgs/chr{chrom}.phased.vcf.gz"
+  chroms: [5, 6, 9, 14, 15, 16, 17, 19]
+  flank_bp: 10000
+  snp_maf: 0.01            # minor-allele-frequency threshold
+  snp_r2: 0.30             # imputation-quality threshold
+  r2_info_field: "R2"      # INFO field holding imputation R^2 (e.g. R2, DR2, INFO)
+
+# ---- HLA allele calls (imputed or molecularly typed) -----------------------
+hla:
+  vcf: "/path/to/hla.phased.vcf.gz"
+  build: "38"              # "38" or "37"
+  maf: 0.05
+  r2: 0.80
+  r2_info_field: "DR2"     # BEAGLE uses DR2; Minimac uses R2
+  resolution: [2, 4]       # retained for reference; hlafactor selects as needed
+
+# ---- hlafactor (HLA functional features) -----------------------------------
+hlafactor:
+  binary: "hlafactor"      # path to the hlafactor executable
+  modules: ["het", "hetf", "exp", "sup", "tapasin", "lignk"]

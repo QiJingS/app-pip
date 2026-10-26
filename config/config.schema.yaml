@@ -1,0 +1,47 @@
+$schema: "http://json-schema.org/draft-07/schema#"
+description: app-pip configuration schema
+type: object
+properties:
+  output_dir: {type: string}
+  build: {type: string, enum: ["37", "38"]}
+  resources:
+    type: object
+    properties:
+      app_variants: {type: string}
+      allotype_definitions: {type: string}
+    required: [app_variants, allotype_definitions]
+  target_genes:
+    type: array
+    items: {type: string}
+  vep_annotation:
+    type: array
+    items: {type: string}
+  genetic_model: {type: string, enum: [additive, dominant, recessive]}
+  allotype_min_freq: {type: number, minimum: 0, maximum: 1}
+  wgs:
+    type: object
+    properties:
+      vcf: {type: string}
+      chroms: {type: array}
+      flank_bp: {type: integer, minimum: 0}
+      snp_maf: {type: number, minimum: 0, maximum: 0.5}
+      snp_r2: {type: number, minimum: 0, maximum: 1}
+      r2_info_field: {type: string}
+    required: [vcf, chroms, snp_maf, snp_r2, r2_info_field]
+  hla:
+    type: object
+    properties:
+      vcf: {type: string}
+      build: {type: string, enum: ["37", "38"]}
+      maf: {type: number, minimum: 0, maximum: 0.5}
+      r2: {type: number, minimum: 0, maximum: 1}
+      r2_info_field: {type: string}
+      resolution: {type: array}
+    required: [vcf, build, maf, r2, r2_info_field]
+  hlafactor:
+    type: object
+    properties:
+      binary: {type: string}
+      modules: {type: array, items: {type: string}}
+    required: [binary, modules]
+required: [output_dir, build, resources, genetic_model, wgs, hla, hlafactor]
