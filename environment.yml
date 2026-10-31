@@ -7,6 +7,5 @@ dependencies:
   - snakemake-minimal >=7.0
   - bcftools >=1.17
   - htslib >=1.17        # tabix / bgzip
-  - qctool               # optional, only if BGEN input is used
   - r-base >=4.2
   - r-vcfr

@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+import sys,os,subprocess
+a=sys.argv; i=a[a.index("-i")+1]; o=a[a.index("-o")+1]; m=a[-1][1:]
+samples=subprocess.run(["bcftools","query","-l",i],capture_output=True,text=True).stdout.split()
+d=os.path.dirname(o)
+def w(fn,cols):
+    with open(os.path.join(d,m+fn),"w") as f:
+        f.write("\t".join(["SampleID"]+cols)+"\n")
+        for s in samples: f.write("\t".join([s]+["1"]*len(cols))+"\n")
+{"het":lambda:w("_heterozygosity.txt",["A","B","C"]),
+ "hetf":lambda:w("_functional_zygosity.txt",["HLA_A_FH","HLA_B_FH","HLA_C_FH"]),
+ "exp":lambda:(w("_exp_A.txt",["expression_value"]),w("_exp_C.txt",["expression_value"])),
+ "sup":lambda:w("_supertypes.txt",["A01","B07"]),
+ "tapasin":lambda:[w(f"_taps_{x}.txt",[f"taps{x}_value" if x!="global" else "taps_global_value"]) for x in ["A","B","C","global"]],
+ "lignk":lambda:w("_HLA_variant_NK.txt",["HLA_C_ligand","HLA_B_ligand"])}[m]()

@@ -1,78 +1,106 @@
 # Reconstruct multi-variant protein allotypes from PHASED genotypes.
 #
-# For each gene with >= 2 defining missense sites present after QC, the amino
-# acid encoded on each haplotype is read at every defining site, ordered from
-# the N- to the C-terminus (by protein position), and concatenated into an
-# allotype string. Each sample is assigned a count (0/1/2) per observed allotype.
+# For each gene with >= 2 defining missense residues present after QC, the
+# amino acid encoded on each haplotype is read at every defining residue,
+# ordered from the N- to the C-terminus (by protein position), and the residues
+# are concatenated into an allotype string. Each sample is assigned the number
+# of copies (0/1/2) of every observed allotype.
 #
-# Robustness fixes vs the original script:
-#   * sites are ordered by protein position, not spreadsheet row order
-#   * missing / unphased calls at a defining site -> that sample's allotypes
-#     for the gene are set to NA (not silently mis-assigned)
-#   * matching uses CHROM + POS + REF/ALT, not POS alone
+#   * sites are matched on CHROM + POS + REF + ALT; a site whose REF/ALT are
+#     swapped in the input VCF is matched and its alleles flipped
+#   * several ALT alleles at the same residue are combined into one position
+#   * a missing call at any defining site sets that sample's allotypes for the
+#     gene to NA (never silently mis-assigned)
+#   * every defining site is reported as used / absent in `allotype_sites.tsv`
 #   * sample IDs are preserved verbatim
 suppressMessages(library(vcfR))
 
-vcf_file <- snakemake@input[["vcf"]]
+vcf_file  <- snakemake@input[["vcf"]]
 defs_file <- snakemake@input[["defs"]]
-build    <- as.character(snakemake@params[["build"]])
-min_freq <- as.numeric(snakemake@params[["min_freq"]])
-out_file <- snakemake@output[["tsv"]]
+build     <- as.character(snakemake@params[["build"]])
+genes_sel <- unlist(snakemake@params[["genes"]])
+target    <- unlist(snakemake@params[["target"]])
+min_freq  <- as.numeric(snakemake@params[["min_freq"]])
+out_file  <- snakemake@output[["tsv"]]
+site_file <- snakemake@output[["sites"]]
 
-defs <- read.table(defs_file, header = TRUE, sep = "\t",
-                   stringsAsFactors = FALSE, check.names = FALSE)
+defs <- read.table(defs_file, header = TRUE, sep = "\t", quote = "",
+                   stringsAsFactors = FALSE, check.names = FALSE,
+                   colClasses = "character")
 poscol <- if (build == "38") "pos38" else "pos37"
+if (length(genes_sel)) defs <- defs[defs$gene %in% genes_sel, ]
+if (length(target))    defs <- defs[defs$gene %in% target, ]
 
 vcf <- read.vcfR(vcf_file, verbose = FALSE)
 fix <- as.data.frame(getFIX(vcf), stringsAsFactors = FALSE)
-fix$POS <- as.character(fix$POS)
-gt_all <- extract.gt(vcf, element = "GT")
+fix$CHROM <- sub("^chr", "", fix$CHROM)
+gt_all  <- extract.gt(vcf, element = "GT", IDtoRowNames = FALSE)
 samples <- colnames(gt_all)
+key_fwd <- paste(fix$CHROM, fix$POS, fix$REF, fix$ALT, sep = ":")
 
 allo_tab <- data.frame(SampleID = samples, stringsAsFactors = FALSE,
                        check.names = FALSE)
+site_log <- list()
+
+allele <- function(g, side) {
+  x <- if (side == 1) sub("[|/].*$", "", g) else sub("^.*[|/]", "", g)
+  suppressWarnings(as.integer(x))                # NA for "." / missing
+}
 
 for (gene in unique(defs$gene)) {
   sites <- defs[defs$gene == gene, ]
-  sites <- sites[order(suppressWarnings(as.integer(sites$aa_position))), ]  # N -> C
-  sites$pos <- as.character(sites[[poscol]])
+  sites$aa_position <- as.integer(sites$aa_position)
+  sites <- sites[order(sites$aa_position), ]
+  k_fwd <- paste(sites$chrom, sites[[poscol]], sites$ref, sites$alt, sep = ":")
+  k_rev <- paste(sites$chrom, sites[[poscol]], sites$alt, sites$ref, sep = ":")
+  idx   <- match(k_fwd, key_fwd)
+  flip  <- is.na(idx) & !is.na(match(k_rev, key_fwd))
+  idx[flip] <- match(k_rev[flip], key_fwd)
+  sites$vcf_idx <- idx; sites$flipped <- flip
 
-  # keep defining sites that are present in the QC'd VCF (match on chrom+pos)
-  key_vcf  <- paste(fix$CHROM, fix$POS)
-  key_site <- paste(sites$chrom, sites$pos)
-  present  <- key_site %in% key_vcf
-  sites <- sites[present, ]
-  if (nrow(sites) < 2) next           # not a multi-variant allotype gene here
+  residues <- sort(unique(sites$aa_position[!is.na(idx)]))
+  used <- !is.na(idx) & length(residues) >= 2
+  site_log[[gene]] <- data.frame(
+    gene = gene, rsid = sites$rsid, aa_position = sites$aa_position,
+    change = paste0(sites$ref_aa, sites$aa_position, sites$alt_aa),
+    status = ifelse(is.na(idx), "absent_after_qc",
+                    ifelse(used, ifelse(flip, "used_flipped", "used"),
+                           "unused_lt2_residues")),
+    stringsAsFactors = FALSE)
+  if (length(residues) < 2) next                 # not a multi-variant gene here
+  sites <- sites[!is.na(idx), ]
 
-  idx <- match(paste(sites$chrom, sites$pos), key_vcf)
-  gt  <- gt_all[idx, , drop = FALSE]
-
-  # build the two haplotype amino-acid strings per sample
-  hap1 <- character(length(samples)); hap2 <- character(length(samples))
-  valid <- rep(TRUE, length(samples))
-  for (s in seq_len(nrow(sites))) {
-    g <- gt[s, ]
-    a <- sub("[|/].*$", "", g); b <- sub("^.*[|/]", "", g)
-    aa_a <- ifelse(a == "0", sites$ref_aa[s],
-             ifelse(a == "1", sites$alt_aa[s], NA))
-    aa_b <- ifelse(b == "0", sites$ref_aa[s],
-             ifelse(b == "1", sites$alt_aa[s], NA))
-    valid <- valid & !is.na(aa_a) & !is.na(aa_b)
-    hap1 <- paste0(hap1, ifelse(is.na(aa_a), "?", aa_a))
-    hap2 <- paste0(hap2, ifelse(is.na(aa_b), "?", aa_b))
+  n <- length(samples)
+  hap <- list(character(n), character(n))
+  valid <- rep(TRUE, n)
+  for (r in residues) {
+    s_r <- sites[sites$aa_position == r, ]
+    for (h in 1:2) {
+      aa <- rep(s_r$ref_aa[1], n)
+      n_alt <- integer(n)
+      for (j in seq_len(nrow(s_r))) {
+        a <- allele(gt_all[s_r$vcf_idx[j], ], h)
+        is_alt <- if (s_r$flipped[j]) a == 0 else a == 1
+        valid <- valid & !is.na(is_alt)
+        is_alt[is.na(is_alt)] <- FALSE
+        aa[is_alt] <- s_r$alt_aa[j]
+        n_alt <- n_alt + is_alt
+      }
+      valid <- valid & n_alt <= 1                # two ALTs on one haplotype: invalid
+      hap[[h]] <- paste0(hap[[h]], aa)
+    }
   }
 
-  # per-sample allotype counts
-  all_types <- sort(unique(c(hap1[valid], hap2[valid])))
-  grid <- matrix(0, nrow = length(samples), ncol = length(all_types),
+  all_types <- sort(unique(c(hap[[1]][valid], hap[[2]][valid])))
+  if (length(all_types) == 0) next
+  grid <- matrix(0, nrow = n, ncol = length(all_types),
                  dimnames = list(samples, all_types))
-  for (i in seq_along(samples)) {
-    if (!valid[i]) { grid[i, ] <- NA; next }
-    grid[i, hap1[i]] <- grid[i, hap1[i]] + 1
-    grid[i, hap2[i]] <- grid[i, hap2[i]] + 1
+  for (h in 1:2) {
+    ix <- cbind(which(valid), match(hap[[h]][valid], all_types))
+    grid[ix] <- grid[ix] + 1
   }
+  grid[!valid, ] <- NA
 
-  # frequency filter (ignoring NA samples)
   denom <- sum(valid) * 2
   if (denom > 0) {
     keep <- colSums(grid, na.rm = TRUE) / denom >= min_freq
@@ -84,4 +112,9 @@ for (gene in unique(defs$gene)) {
 }
 
 write.table(allo_tab, out_file, sep = "\t", quote = FALSE,
+            row.names = FALSE, col.names = TRUE)
+site_df <- if (length(site_log)) do.call(rbind, site_log) else
+  data.frame(gene = character(), rsid = character(), aa_position = integer(),
+             change = character(), status = character())
+write.table(site_df, site_file, sep = "\t", quote = FALSE,
             row.names = FALSE, col.names = TRUE)

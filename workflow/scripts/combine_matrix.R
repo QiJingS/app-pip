@@ -1,17 +1,21 @@
 # Merge every feature layer into one per-sample matrix, and emit a feature
 # dictionary (provenance) and a QC summary. Sample IDs preserved verbatim.
 
-snps_file <- snakemake@input[["snps"]]
-allo_file <- snakemake@input[["allo"]]
-hladir    <- snakemake@params[["hladir"]]
-modules   <- snakemake@params[["modules"]]
+snps_file   <- snakemake@input[["snps"]]
+allo_file   <- snakemake@input[["allo"]]
+sites_file  <- snakemake@input[["sites"]]
+counts_file <- snakemake@input[["counts"]]
+hladir      <- snakemake@params[["hladir"]]
+modules     <- unlist(snakemake@params[["modules"]])
+build       <- snakemake@params[["build"]]
+variants    <- snakemake@params[["variants"]]
 
 out_matrix <- snakemake@output[["matrix"]]
 out_dict   <- snakemake@output[["dict"]]
 out_qc     <- snakemake@output[["qc"]]
 
 rd <- function(f) {
-  d <- read.table(f, header = TRUE, sep = "	", stringsAsFactors = FALSE,
+  d <- read.table(f, header = TRUE, sep = "\t", stringsAsFactors = FALSE,
                   check.names = FALSE, quote = "", comment.char = "", fill = TRUE)
   nm <- names(d)
   d[, !(is.na(nm) | trimws(nm) == ""), drop = FALSE]
@@ -30,74 +34,72 @@ add_dict <- function(cols, source, desc) {
 
 matrix <- snps
 add_dict(setdiff(colnames(snps), "SampleID"), "app-pip:snp_features",
-         "SNP dosage under the configured genetic model")
+         "ALT-allele dosage (additive, 0/1/2)")
 
 if (ncol(allo) > 1) {
   matrix <- merge(matrix, allo, by = "SampleID", all = TRUE)
   add_dict(setdiff(colnames(allo), "SampleID"), "app-pip:allotype",
-           "Multi-variant protein allotype count (0/1/2)")
+           "Copies of the protein allotype (0/1/2); residues ordered N- to C-terminus")
 }
 
-# ---- helper: read a hlafactor output, rename the sample column to SampleID,
-#      keep selected value columns renamed with a prefix
-take <- function(path, value_cols, newnames, source, desc) {
-  if (!file.exists(path)) return(invisible())
-  d <- rd(path)
+# ---- hlafactor outputs. A requested module whose output is missing is an
+#      error (features are never dropped silently).
+need <- function(path, m) {
+  if (!file.exists(path))
+    stop(sprintf("hlafactor module '-%s' did not produce expected file: %s", m, path))
+  path
+}
+merge_in <- function(d, newnames, source, desc) {
+  colnames(d) <- c("SampleID", newnames)
+  matrix <<- merge(matrix, d, by = "SampleID", all = TRUE)
+  add_dict(newnames, source, desc)
+}
+take <- function(path, m, value_cols, newnames, source, desc) {
+  d <- rd(need(path, m))
   scol <- intersect(c("SampleID", "sampleid"), colnames(d))[1]
-  colnames(d)[colnames(d) == scol] <- "SampleID"
-  value_cols <- intersect(value_cols, colnames(d))
-  if (length(value_cols) == 0) return(invisible())
-  sub <- d[, c("SampleID", value_cols), drop = FALSE]
-  colnames(sub) <- c("SampleID", newnames[seq_along(value_cols)])
-  matrix <<- merge(matrix, sub, by = "SampleID", all = TRUE)
-  add_dict(newnames[seq_along(value_cols)], source, desc)
+  if (is.na(scol)) stop(sprintf("no sample ID column in %s", path))
+  miss <- setdiff(value_cols, colnames(d))
+  if (length(miss)) stop(sprintf("columns %s missing in %s",
+                                 paste(miss, collapse = ", "), path))
+  merge_in(d[, c(scol, value_cols), drop = FALSE], newnames, source, desc)
 }
 
 p <- function(m, suffix) file.path(hladir, paste0(m, suffix))
 
 for (m in modules) {
   if (m == "het") {
-    f <- p(m, "_heterozygosity.txt")
-    if (file.exists(f)) {
-      d <- rd(f); colnames(d)[1] <- "SampleID"
-      loci <- setdiff(colnames(d), "SampleID")
-      colnames(d) <- c("SampleID", paste0("Het.", loci))
-      matrix <- merge(matrix, d, by = "SampleID", all = TRUE)
-      add_dict(paste0("Het.", loci), "hlafactor:-het",
-               "HLA gene heterozygosity (Het/Hom)")
-    }
+    d <- rd(need(p(m, "_heterozygosity.txt"), m))
+    loci <- colnames(d)[-1]
+    merge_in(d, paste0("Het.", loci), "hlafactor:-het",
+             "HLA gene heterozygosity (Het/Hom)")
   } else if (m == "hetf") {
-    take(p(m, "_functional_zygosity.txt"),
+    take(p(m, "_functional_zygosity.txt"), m,
          c("HLA_A_FH", "HLA_B_FH", "HLA_C_FH"),
          c("FH.HLA-A", "FH.HLA-B", "FH.HLA-C"),
          "hlafactor:-hetf", "HLA functional heterozygosity (allotype divergence)")
   } else if (m == "exp") {
-    take(p(m, "_exp_A.txt"), "expression_value", "Exp.HLA-A",
+    take(p(m, "_exp_A.txt"), m, "expression_value", "Exp.HLA-A",
          "hlafactor:-exp", "HLA-A allele-specific expression proxy")
-    take(p(m, "_exp_C.txt"), "expression_value", "Exp.HLA-C",
+    take(p(m, "_exp_C.txt"), m, "expression_value", "Exp.HLA-C",
          "hlafactor:-exp", "HLA-C allele-specific expression proxy")
   } else if (m == "tapasin") {
-    take(p(m, "_taps_A.txt"), "tapsA_value", "TD.HLA-A", "hlafactor:-tapasin", "Tapasin dependence HLA-A")
-    take(p(m, "_taps_B.txt"), "tapsB_value", "TD.HLA-B", "hlafactor:-tapasin", "Tapasin dependence HLA-B")
-    take(p(m, "_taps_C.txt"), "tapsC_value", "TD.HLA-C", "hlafactor:-tapasin", "Tapasin dependence HLA-C")
-    take(p(m, "_taps_global.txt"), "taps_global_value", "TD.global", "hlafactor:-tapasin", "Tapasin dependence global")
+    take(p(m, "_taps_A.txt"), m, "tapsA_value", "TD.HLA-A", "hlafactor:-tapasin", "Tapasin dependence HLA-A")
+    take(p(m, "_taps_B.txt"), m, "tapsB_value", "TD.HLA-B", "hlafactor:-tapasin", "Tapasin dependence HLA-B")
+    take(p(m, "_taps_C.txt"), m, "tapsC_value", "TD.HLA-C", "hlafactor:-tapasin", "Tapasin dependence HLA-C")
+    take(p(m, "_taps_global.txt"), m, "taps_global_value", "TD.global", "hlafactor:-tapasin", "Tapasin dependence global")
   } else if (m == "sup") {
-    f <- p(m, "_supertypes.txt")
-    if (file.exists(f)) {
-      d <- rd(f); colnames(d)[1] <- "SampleID"
-      st <- setdiff(colnames(d), "SampleID")
-      colnames(d) <- c("SampleID", paste0("Supertype.", st))
-      matrix <- merge(matrix, d, by = "SampleID", all = TRUE)
-      add_dict(paste0("Supertype.", st), "hlafactor:-sup", "HLA supertype count")
-    }
+    d <- rd(need(p(m, "_supertypes.txt"), m))
+    merge_in(d, paste0("Supertype.", colnames(d)[-1]), "hlafactor:-sup",
+             "HLA supertype count")
   } else if (m == "lignk") {
-    take(p(m, "_HLA_variant_NK.txt"),
+    take(p(m, "_HLA_variant_NK.txt"), m,
          c("HLA_C_ligand", "HLA_B_ligand"),
          c("NK.C1C2", "NK.Bw4Bw6"),
          "hlafactor:-lignk", "NK cell ligand group / HLA-B -21 M/T")
   } else if (m == "amac") {
-    # residue-level table is large & transposed; kept as a separate file
     message("[combine] -amac output kept separate (not merged into main matrix)")
+  } else {
+    stop(sprintf("unknown hlafactor module: %s", m))
   }
 }
 
@@ -106,13 +108,32 @@ write.table(matrix, out_matrix, sep = "\t", quote = FALSE,
 write.table(dict, out_dict, sep = "\t", quote = FALSE,
             row.names = FALSE, col.names = TRUE)
 
+counts <- rd(counts_file)
+sites  <- rd(sites_file)
+cnt <- function(step) counts$n[counts$step == step]
+allo_genes <- unique(sites$gene[grepl("^used", sites$status)])
 qc <- c(
-  sprintf("app-pip feature matrix"),
+  "app-pip feature matrix",
+  sprintf("reference build:    GRCh%s", build),
+  sprintf("variant catalogue:  %s", variants),
   sprintf("samples:            %d", nrow(matrix)),
-  sprintf("total features:     %d", ncol(matrix) - 1),
-  sprintf("  SNP features:     %d", sum(dict$source == "app-pip:snp_features")),
-  sprintf("  allotypes:        %d", sum(dict$source == "app-pip:allotype")),
-  sprintf("  HLA features:     %d", sum(grepl("^hlafactor", dict$source))),
+  "",
+  "variant extraction",
+  sprintf("  catalogue sites:          %s", cnt("catalogue_sites")),
+  sprintf("  records in input:         %s", cnt("extracted_records")),
+  sprintf("  passed MAF / R2 filters:  %s", cnt("passed_maf_r2")),
+  "",
+  "allotype-defining sites",
+  sprintf("  used:                     %d", sum(grepl("^used", sites$status))),
+  sprintf("  absent after QC:          %d", sum(sites$status == "absent_after_qc")),
+  sprintf("  genes with allotypes:     %s",
+          if (length(allo_genes)) paste(allo_genes, collapse = ", ") else "none"),
+  "",
+  "features",
+  sprintf("  total:                    %d", ncol(matrix) - 1),
+  sprintf("  SNP features:             %d", sum(dict$source == "app-pip:snp_features")),
+  sprintf("  allotypes:                %d", sum(dict$source == "app-pip:allotype")),
+  sprintf("  HLA features:             %d", sum(grepl("^hlafactor", dict$source))),
   sprintf("hlafactor modules:  %s", paste(modules, collapse = ", "))
 )
 writeLines(qc, out_qc)

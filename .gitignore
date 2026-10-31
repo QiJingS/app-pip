@@ -5,3 +5,9 @@ results/
 results*/
 config/config.hcv.yaml
 RUN_CLUSTER.md
+results/
+.snakemake/
+test/results*/
+test/*.vcf.gz
+test/*.vcf.gz.tbi
+test/config.test.yaml

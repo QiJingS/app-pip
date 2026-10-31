@@ -16,32 +16,36 @@ properties:
   vep_annotation:
     type: array
     items: {type: string}
-  genetic_model: {type: string, enum: [additive, dominant, recessive]}
+  allotype_genes:
+    type: array
+    items: {type: string}
   allotype_min_freq: {type: number, minimum: 0, maximum: 1}
   wgs:
     type: object
     properties:
       vcf: {type: string}
       chroms: {type: array}
-      flank_bp: {type: integer, minimum: 0}
       snp_maf: {type: number, minimum: 0, maximum: 0.5}
       snp_r2: {type: number, minimum: 0, maximum: 1}
       r2_info_field: {type: string}
     required: [vcf, chroms, snp_maf, snp_r2, r2_info_field]
+    additionalProperties: false
   hla:
     type: object
     properties:
       vcf: {type: string}
-      build: {type: string, enum: ["37", "38"]}
       maf: {type: number, minimum: 0, maximum: 0.5}
       r2: {type: number, minimum: 0, maximum: 1}
       r2_info_field: {type: string}
-      resolution: {type: array}
-    required: [vcf, build, maf, r2, r2_info_field]
+    required: [vcf, maf, r2, r2_info_field]
+    additionalProperties: false
   hlafactor:
     type: object
     properties:
       binary: {type: string}
-      modules: {type: array, items: {type: string}}
+      modules:
+        type: array
+        items: {type: string, enum: [het, hetf, exp, sup, tapasin, lignk, amac]}
     required: [binary, modules]
-required: [output_dir, build, resources, genetic_model, wgs, hla, hlafactor]
+required: [output_dir, build, resources, allotype_min_freq, wgs, hla, hlafactor]
+additionalProperties: false
