@@ -49,10 +49,32 @@ need <- function(path, m) {
     stop(sprintf("hlafactor module '-%s' did not produce expected file: %s", m, path))
   path
 }
-merge_in <- function(d, newnames, source, desc) {
+# hlafactor writes missing values as "NA", "nan" or "."; every feature is
+# returned as numeric so the matrix can go straight into association tools.
+num <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  x[is.nan(x)] <- NA
+  x
+}
+merge_in <- function(d, newnames, source, desc, numeric = TRUE) {
   colnames(d) <- c("SampleID", newnames)
+  if (numeric) for (k in newnames) d[[k]] <- num(d[[k]])
   matrix <<- merge(matrix, d, by = "SampleID", all = TRUE)
   add_dict(newnames, source, desc)
+}
+# "HLA_A" -> "HLA-A"
+locus <- function(x) sub("^HLA_", "HLA-", x)
+# Genotype strings such as "C1/C2" or "BW6/BW6" -> per-category copy counts
+# (0/1/2). A sample with a missing allele ("." or absent) is NA for the locus.
+count_categories <- function(g) {
+  parts <- strsplit(ifelse(is.na(g), "", g), "/", fixed = TRUE)
+  ok <- vapply(parts, function(p) length(p) == 2 && !any(p %in% c("", ".", "NA")),
+               logical(1))
+  cats <- sort(unique(unlist(parts[ok])))
+  out <- sapply(cats, function(cc) vapply(parts, function(p) sum(p == cc), numeric(1)))
+  out <- matrix(out, nrow = length(g), dimnames = list(NULL, cats))
+  out[!ok, ] <- NA
+  out
 }
 take <- function(path, m, value_cols, newnames, source, desc) {
   d <- rd(need(path, m))
@@ -69,9 +91,10 @@ p <- function(m, suffix) file.path(hladir, paste0(m, suffix))
 for (m in modules) {
   if (m == "het") {
     d <- rd(need(p(m, "_heterozygosity.txt"), m))
-    loci <- colnames(d)[-1]
-    merge_in(d, paste0("Het.", loci), "hlafactor:-het",
-             "HLA gene heterozygosity (Het/Hom)")
+    for (k in colnames(d)[-1])
+      d[[k]] <- ifelse(d[[k]] == "Het", 1, ifelse(d[[k]] == "Hom", 0, NA))
+    merge_in(d, paste0("Het.", locus(colnames(d)[-1])), "hlafactor:-het",
+             "HLA locus heterozygosity (1 = heterozygous, 0 = homozygous)")
   } else if (m == "hetf") {
     take(p(m, "_functional_zygosity.txt"), m,
          c("HLA_A_FH", "HLA_B_FH", "HLA_C_FH"),
@@ -92,10 +115,18 @@ for (m in modules) {
     merge_in(d, paste0("Supertype.", colnames(d)[-1]), "hlafactor:-sup",
              "HLA supertype count")
   } else if (m == "lignk") {
-    take(p(m, "_HLA_variant_NK.txt"), m,
-         c("HLA_C_ligand", "HLA_B_ligand"),
-         c("NK.C1C2", "NK.Bw4Bw6"),
-         "hlafactor:-lignk", "NK cell ligand group / HLA-B -21 M/T")
+    d <- rd(need(p(m, "_HLA_variant_NK.txt"), m))
+    scol <- intersect(c("SampleID", "sampleid"), colnames(d))[1]
+    for (k in setdiff(colnames(d), scol)) {
+      cnt <- count_categories(d[[k]])
+      if (ncol(cnt) == 0) next
+      cats <- sub("^BW", "Bw", colnames(cnt))
+      nm <- paste0("NK.", cats)
+      if (any(nm %in% dict$feature)) nm <- paste0("NK.", locus(k), ".", cats)
+      merge_in(data.frame(d[[scol]], cnt, check.names = FALSE), nm,
+               "hlafactor:-lignk",
+               sprintf("Copies of NK-cell ligand category (%s; 0/1/2)", locus(k)))
+    }
   } else if (m == "amac") {
     message("[combine] -amac output kept separate (not merged into main matrix)")
   } else {

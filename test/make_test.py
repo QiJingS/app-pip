@@ -1,6 +1,6 @@
 import csv, random, gzip, sys
 random.seed(1)
-N=40; S=[f"S{i:03d}" for i in range(N)]
+N=int(__import__("os").environ.get("NS","40")); S=[f"S{i+1}" for i in range(N)] if __import__("os").environ.get("REALNAMES") else [f"S{i:03d}" for i in range(N)]
 rows=list(csv.DictReader(open("resources/app_variants_v2.tsv"),delimiter="\t"))
 recs={}
 for r in rows:
@@ -33,19 +33,27 @@ for k,(nm,pos) in enumerate([("HLA_A*01",29942000),("HLA_A*01:01",29942001),("HL
 open("test/hla.vcf","w").write("\n".join(h)+"\n")
 # fake hlafactor
 fake=r'''#!/usr/bin/env python3
-import sys,os,subprocess
+# Stand-in for hlafactor (https://github.com/QiJingS/hlafactor) that writes files
+# with the same names and formats as hlafactor v0.0.0, including text genotypes
+# ("Het"/"Hom", "C1/C2") and "nan" missing values.
+import sys,os,subprocess,random
 a=sys.argv; i=a[a.index("-i")+1]; o=a[a.index("-o")+1]; m=a[-1][1:]
-samples=subprocess.run(["bcftools","query","-l",i],capture_output=True,text=True).stdout.split()
-d=os.path.dirname(o)
-def w(fn,cols):
-    with open(os.path.join(d,m+fn),"w") as f:
-        f.write("\t".join(["SampleID"]+cols)+"\n")
-        for s in samples: f.write("\t".join([s]+["1"]*len(cols))+"\n")
-{"het":lambda:w("_heterozygosity.txt",["A","B","C"]),
- "hetf":lambda:w("_functional_zygosity.txt",["HLA_A_FH","HLA_B_FH","HLA_C_FH"]),
- "exp":lambda:(w("_exp_A.txt",["expression_value"]),w("_exp_C.txt",["expression_value"])),
- "sup":lambda:w("_supertypes.txt",["A01","B07"]),
- "tapasin":lambda:[w(f"_taps_{x}.txt",[f"taps{x}_value" if x!="global" else "taps_global_value"]) for x in ["A","B","C","global"]],
- "lignk":lambda:w("_HLA_variant_NK.txt",["HLA_C_ligand","HLA_B_ligand"])}[m]()
+S=subprocess.run(["bcftools","query","-l",i],capture_output=True,text=True).stdout.split()
+d=os.path.dirname(o) or "."; random.seed(m)
+def w(fn,cols,f):
+    with open(os.path.join(d,m+fn),"w") as fh:
+        fh.write("\t".join(cols)+"\n")
+        for k,s in enumerate(S): fh.write("\t".join([s]+f(k))+"\n")
+miss=lambda k,x: "nan" if k==0 else x
+if m=="het": w("_heterozygosity.txt",["SampleID","HLA_A","HLA_B","HLA_C",""],lambda k:[random.choice(["Het","Hom"]),"NA" if k==0 else "Het","Het"])
+elif m=="hetf": w("_functional_zygosity.txt",["sampleid","HLA_A_allele","HLA_A_FH","HLA_B_allele","HLA_B_FH","HLA_C_allele","HLA_C_FH"],lambda k:["x","0.5","x",miss(k,"0.6"),"x","0.7"])
+elif m=="exp":
+    w("_exp_A.txt",["SampleID","locus","alleles","miss_match","expression_value"],lambda k:["HLA_A","x","NA","-0.2"])
+    w("_exp_C.txt",["SampleID","locus","alleles","miss_match","expression_value"],lambda k:["HLA_C","x","NA","300"])
+elif m=="sup": w("_supertypes.txt",["SampleID","A01","A02","B07",""],lambda k:["1","1","0"])
+elif m=="tapasin":
+    for x in "ABC": w(f"_taps_{x}.txt",["SampleID","locus","alleles","miss_match",f"taps{x}_value"],lambda k:["HLA_"+x,"x","NA",miss(k,"0.8")])
+    w("_taps_global.txt",["SampleID","tapsA_value","tapsB_value","tapsC_value","taps_global_value"],lambda k:["0.8","0.8","0.8",miss(k,"1.2")])
+elif m=="lignk": w("_HLA_variant_NK.txt",["SampleID","HLA_C_ligand","HLA_B_ligand"],lambda k:[random.choice(["C1/C1","C1/C2","C2/C2"]),"BW6/." if k==0 else random.choice(["BW4/BW6","BW6/BW6"])])
 '''
 open("test/fake_hlafactor","w").write(fake)

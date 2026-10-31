@@ -113,11 +113,19 @@ rule extract_snps:
         i=0
         for v in {input.vcf}; do
             i=$((i+1))
-            # match the contig naming of this file
-            if bcftools view -h "$v" | grep -q '^##contig=<ID=chr'; then
+            # match the contig naming of this file (first record; no index needed)
+            first=$(bcftools query -f '%CHROM\n' "$v" 2>/dev/null | head -n1 || true)
+            if [[ "$first" == chr* ]]; then
                 awk 'BEGIN{{OFS="\t"}} {{print "chr"$1,$2}}' {input.regions} > "$tmp/r.$i.tsv"
             else
                 cp {input.regions} "$tmp/r.$i.tsv"
+            fi
+            if ! bcftools view -h "$v" | grep -c '^##contig=' > /dev/null; then
+                bcftools view -h "$v" \
+                  | awk -v r="$tmp/r.$i.tsv" 'BEGIN{{while((getline l < r)>0){{split(l,a,"\t"); if(!(a[1] in s)){{s[a[1]]=1; o[++n]=a[1]}}}}}}
+                         /^#CHROM/{{for(k=1;k<=n;k++) print "##contig=<ID="o[k]">"}} {{print}}' > "$tmp/h.$i.txt"
+                bcftools reheader -h "$tmp/h.$i.txt" -o "$tmp/in.$i.vcf.gz" "$v"
+                v="$tmp/in.$i.vcf.gz"
             fi
             bcftools view -T "$tmp/r.$i.tsv" "$v" -Ou \
               | bcftools norm -m -any -Oz -o "$tmp/part.$i.vcf.gz"
@@ -127,7 +135,12 @@ rule extract_snps:
           | bcftools +fill-tags -Oz -o {output.raw} -- -t AF,MAF
         bcftools index -t {output.raw}
 
-        # INFO/{params.r2f} absent (e.g. typed variants) -> kept
+        if ! bcftools view -h {output.raw} | grep -c '^##INFO=<ID={params.r2f},' > /dev/null; then
+            echo "ERROR: INFO/{params.r2f} is not defined in the genotype VCF header." >&2
+            echo "Set wgs.r2_info_field in config.yaml to the imputation-quality field used (e.g. R2, DR2, INFO)." >&2
+            exit 1
+        fi
+        # INFO/{params.r2f} absent on a record (e.g. typed variants) -> kept
         bcftools view -e 'INFO/{params.r2f}!="." && INFO/{params.r2f} < {params.r2}' {output.raw} -Ou \
           | bcftools view -i 'INFO/MAF > {params.maf}' -Oz -o {output.vcf}
         bcftools index -t {output.vcf}
@@ -220,13 +233,31 @@ rule extract_hla:
     shell:
         r"""
         set -euo pipefail
-        c={params.chrom}
-        if bcftools view -h {input.vcf} | grep -q '^##contig=<ID=chr'; then c="chr$c"; fi
-        bcftools view -r "$c:{params.start}-{params.end}" {input.vcf} -Ou \
+        v={input.vcf}
+        [ -s "$v" ] || {{ echo "ERROR: HLA VCF is missing or empty: $v" >&2; exit 1; }}
+        first=$(bcftools query -f '%CHROM\n' "$v" | head -n1 || true)
+        [ -n "$first" ] || {{ echo "ERROR: no variant records could be read from $v" >&2; exit 1; }}
+        c={params.chrom}; [[ "$first" == chr* ]] && c="chr$c"
+        if ! bcftools view -h "$v" | grep -c '^##INFO=<ID={params.r2f},' > /dev/null; then
+            echo "ERROR: INFO/{params.r2f} is not defined in the header of $v." >&2
+            echo "Set hla.r2_info_field in config.yaml (BEAGLE: DR2; Minimac: R2)." >&2
+            exit 1
+        fi
+        # BEAGLE output often lacks ##contig lines, which BCF output requires
+        tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+        if ! bcftools view -h "$v" | grep -c "^##contig=<ID=$c[,>]" > /dev/null; then
+            bcftools view -h "$v" | awk -v c="$c" '/^#CHROM/{{print "##contig=<ID="c">"}} {{print}}' > "$tmp/h.txt"
+            bcftools reheader -h "$tmp/h.txt" -o "$tmp/hla.vcf.gz" "$v"
+            v="$tmp/hla.vcf.gz"
+        fi
+        # -t streams the file, so no .tbi/.csi index is required
+        bcftools view -t "$c:{params.start}-{params.end}" "$v" -Ou \
           | bcftools +fill-tags -Ou -- -t AF,MAF \
           | bcftools view -e 'INFO/{params.r2f}!="." && INFO/{params.r2f} < {params.r2}' -Ou \
           | bcftools view -i 'INFO/MAF > {params.maf}' -Oz -o {output.vcf}
         bcftools index -t {output.vcf}
+        n=$(bcftools view -H {output.vcf} | wc -l)
+        [ "$n" -gt 0 ] || {{ echo "ERROR: no HLA alleles left after region/MAF/R2 filtering of $v" >&2; exit 1; }}
         """
 
 # ----------------------------------------------------------------------------
