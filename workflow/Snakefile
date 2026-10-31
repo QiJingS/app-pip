@@ -88,7 +88,8 @@ rule make_regions:
 
 # ----------------------------------------------------------------------------
 # 2. Extract catalogue variants from the phased genotypes, split multi-allelic
-#    records, recompute MAF, and filter on MAF and imputation R^2.
+#    records, and filter on minor allele frequency (computed from the
+#    genotypes; no bcftools plugins needed) and imputation R^2.
 #    Contig names with or without a "chr" prefix are both supported.
 # ----------------------------------------------------------------------------
 rule extract_snps:
@@ -131,8 +132,7 @@ rule extract_snps:
               | bcftools norm -m -any -Oz -o "$tmp/part.$i.vcf.gz"
             bcftools index -t "$tmp/part.$i.vcf.gz"
         done
-        bcftools concat -a "$tmp"/part.*.vcf.gz -Ou \
-          | bcftools +fill-tags -Oz -o {output.raw} -- -t AF,MAF
+        bcftools concat -a "$tmp"/part.*.vcf.gz -Oz -o {output.raw}
         bcftools index -t {output.raw}
 
         if ! bcftools view -h {output.raw} | grep -c '^##INFO=<ID={params.r2f},' > /dev/null; then
@@ -142,7 +142,7 @@ rule extract_snps:
         fi
         # INFO/{params.r2f} absent on a record (e.g. typed variants) -> kept
         bcftools view -e 'INFO/{params.r2f}!="." && INFO/{params.r2f} < {params.r2}' {output.raw} -Ou \
-          | bcftools view -i 'INFO/MAF > {params.maf}' -Oz -o {output.vcf}
+          | bcftools view --min-af {params.maf}:minor -Oz -o {output.vcf}
         bcftools index -t {output.vcf}
 
         n_target=$(wc -l < {input.regions})
@@ -252,9 +252,8 @@ rule extract_hla:
         fi
         # -t streams the file, so no .tbi/.csi index is required
         bcftools view -t "$c:{params.start}-{params.end}" "$v" -Ou \
-          | bcftools +fill-tags -Ou -- -t AF,MAF \
           | bcftools view -e 'INFO/{params.r2f}!="." && INFO/{params.r2f} < {params.r2}' -Ou \
-          | bcftools view -i 'INFO/MAF > {params.maf}' -Oz -o {output.vcf}
+          | bcftools view --min-af {params.maf}:minor -Oz -o {output.vcf}
         bcftools index -t {output.vcf}
         n=$(bcftools view -H {output.vcf} | wc -l)
         [ "$n" -gt 0 ] || {{ echo "ERROR: no HLA alleles left after region/MAF/R2 filtering of $v" >&2; exit 1; }}
