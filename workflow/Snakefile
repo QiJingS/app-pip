@@ -180,12 +180,32 @@ rule check_phased:
         """
 
 # ----------------------------------------------------------------------------
+# 3b. Genotype table for the R steps (CHROM POS ID REF ALT + one GT column per
+#     sample). Reading this plain table keeps R free of extra packages.
+# ----------------------------------------------------------------------------
+rule genotype_table:
+    input:
+        vcf = rules.extract_snps.output.vcf,
+        ok  = rules.check_phased.output.ok
+    output:
+        tsv = temp(f"{OUTDIR}/app_snps.gt.tsv")
+    shell:
+        r"""
+        set -euo pipefail
+        {{
+            printf "CHROM\tPOS\tID\tREF\tALT"
+            bcftools query -l {input.vcf} | awk '{{printf "\t%s", $0}}'
+            printf "\n"
+            bcftools query -f '%CHROM\t%POS\t%ID\t%REF\t%ALT[\t%GT]\n' {input.vcf}
+        }} > {output.tsv}
+        """
+
+# ----------------------------------------------------------------------------
 # 4. Variant features: per-variant ALT-allele dosages (additive, 0/1/2)
 # ----------------------------------------------------------------------------
 rule snp_features:
     input:
-        vcf = rules.extract_snps.output.vcf,
-        ok  = rules.check_phased.output.ok
+        gt  = rules.genotype_table.output.tsv
     output:
         tsv = f"{OUTDIR}/app_snp_features.tsv"
     benchmark:
@@ -198,8 +218,7 @@ rule snp_features:
 # ----------------------------------------------------------------------------
 rule allotypes:
     input:
-        vcf  = rules.extract_snps.output.vcf,
-        ok   = rules.check_phased.output.ok,
+        gt   = rules.genotype_table.output.tsv,
         defs = RES["allotype_definitions"]
     output:
         tsv   = f"{OUTDIR}/app_allotypes.tsv",

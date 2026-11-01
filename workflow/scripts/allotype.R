@@ -13,9 +13,7 @@
 #     gene to NA (never silently mis-assigned)
 #   * every defining site is reported as used / absent in `allotype_sites.tsv`
 #   * sample IDs are preserved verbatim
-suppressMessages(library(vcfR))
-
-vcf_file  <- snakemake@input[["vcf"]]
+vcf_file  <- snakemake@input[["gt"]]
 defs_file <- snakemake@input[["defs"]]
 build     <- as.character(snakemake@params[["build"]])
 genes_sel <- unlist(snakemake@params[["genes"]])
@@ -31,10 +29,19 @@ poscol <- if (build == "38") "pos38" else "pos37"
 if (length(genes_sel)) defs <- defs[defs$gene %in% genes_sel, ]
 if (length(target))    defs <- defs[defs$gene %in% target, ]
 
-vcf <- read.vcfR(vcf_file, verbose = FALSE)
-fix <- as.data.frame(getFIX(vcf), stringsAsFactors = FALSE)
+# Read the genotype table written by bcftools query (rule genotype_table):
+# columns CHROM POS ID REF ALT, then one GT column per sample.
+read_gt_table <- function(f) {
+  d <- read.delim(f, header = TRUE, colClasses = "character", check.names = FALSE,
+                  quote = "", comment.char = "", na.strings = character(0))
+  list(fix = d[, 1:5, drop = FALSE],
+       gt  = as.matrix(d[, -(1:5), drop = FALSE]))
+}
+
+tab <- read_gt_table(vcf_file)
+fix <- tab$fix
 fix$CHROM <- sub("^chr", "", fix$CHROM)
-gt_all  <- extract.gt(vcf, element = "GT", IDtoRowNames = FALSE)
+gt_all  <- tab$gt
 samples <- colnames(gt_all)
 key_fwd <- paste(fix$CHROM, fix$POS, fix$REF, fix$ALT, sep = ":")
 

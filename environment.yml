@@ -8,4 +8,3 @@ dependencies:
   - bcftools >=1.17
   - htslib >=1.17        # tabix / bgzip
   - r-base >=4.2
-  - r-vcfr

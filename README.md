@@ -47,7 +47,7 @@ allotype-defining sites, no code change needed.
 ## Requirements
 
 - `snakemake`, `bcftools` (with `tabix`/`bgzip`)
-- `R` with the `vcfR` package
+- `R` (base installation only; no extra R packages are needed)
 - [`hlafactor`](https://github.com/QiJingS/hlafactor): download the prebuilt
   binary for Linux x86_64 or macOS arm64 from its releases page and put
   `bin/hlafactor` on `PATH`, or set `hlafactor.binary` in the config to its path

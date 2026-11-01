@@ -1,14 +1,21 @@
 # Recode phased genotypes into additive ALT-allele dosages (0/1/2).
 # Multi-allelic sites have been split upstream, so each record has one ALT.
 # Sample IDs are preserved verbatim (no automatic "X" prefixing).
-suppressMessages(library(vcfR))
-
-vcf_file <- snakemake@input[["vcf"]]
+vcf_file <- snakemake@input[["gt"]]
 out_file <- snakemake@output[["tsv"]]
 
-vcf <- read.vcfR(vcf_file, verbose = FALSE)
-gt  <- extract.gt(vcf, element = "GT", IDtoRowNames = FALSE)          # rows = variants, cols = samples
-fix <- getFIX(vcf)
+# Read the genotype table written by bcftools query (rule genotype_table):
+# columns CHROM POS ID REF ALT, then one GT column per sample.
+read_gt_table <- function(f) {
+  d <- read.delim(f, header = TRUE, colClasses = "character", check.names = FALSE,
+                  quote = "", comment.char = "", na.strings = character(0))
+  list(fix = d[, 1:5, drop = FALSE],
+       gt  = as.matrix(d[, -(1:5), drop = FALSE]))
+}
+
+tab <- read_gt_table(vcf_file)
+gt  <- tab$gt                                    # rows = variants, cols = samples
+fix <- as.matrix(tab$fix)
 
 # Variant identifier: rsID (or CHROM:POS if absent); records sharing an
 # identifier (split multi-allelic sites) get their ALT allele appended.
