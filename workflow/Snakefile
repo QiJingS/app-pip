@@ -36,10 +36,13 @@ CHROMS   = [str(c) for c in config["wgs"]["chroms"]]
 # Extended MHC region used to extract HLA calls
 HLA_REGION = {"38": ("6", 28510120, 33480577), "37": ("6", 28477797, 33448354)}[BUILD]
 
-def wgs_inputs():
-    if "{chrom}" in WGS_VCF:
-        return expand(WGS_VCF, chrom=CHROMS)
-    return [WGS_VCF]
+# One extraction job per chromosome file (run in parallel); a single
+# genome-wide file is extracted as one part named "all".
+PER_CHROM = "{chrom}" in WGS_VCF
+PARTS = CHROMS if PER_CHROM else ["all"]
+
+def part_input(wc):
+    return WGS_VCF.format(chrom=wc.part) if PER_CHROM else WGS_VCF
 
 rule all:
     input:
@@ -87,14 +90,71 @@ rule make_regions:
                 out.write(f"{chrom}\t{pos}\n")
 
 # ----------------------------------------------------------------------------
-# 2. Extract catalogue variants from the phased genotypes, split multi-allelic
-#    records, and filter on minor allele frequency (computed from the
-#    genotypes; no bcftools plugins needed) and imputation R^2.
-#    Contig names with or without a "chr" prefix are both supported.
+# 2a. Extract catalogue sites from one input file (one job per chromosome).
+#     With a .tbi/.csi index the file is read by random access (-R) and the
+#     records are then matched exactly to the catalogue positions (-T);
+#     without an index the file is streamed (-T only, slower).
+#     Contig names with or without a "chr" prefix are both supported, and a
+#     missing ##contig header line is added to the (small) extracted file.
+# ----------------------------------------------------------------------------
+rule extract_part:
+    input:
+        vcf = part_input,
+        regions = rules.make_regions.output.tsv
+    output:
+        vcf = temp(f"{OUTDIR}/parts/{{part}}.vcf.gz"),
+        tbi = temp(f"{OUTDIR}/parts/{{part}}.vcf.gz.tbi")
+    params:
+        chrom = lambda wc: wc.part if PER_CHROM else ""
+    benchmark:
+        f"{OUTDIR}/bench/extract_part_{{part}}.tsv"
+    shell:
+        r"""
+        set -euo pipefail
+        tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+        v={input.vcf}
+        # catalogue sites for this file
+        if [ -n "{params.chrom}" ]; then
+            awk -v c="{params.chrom}" '$1 == c' {input.regions} > "$tmp/r.tsv"
+        else
+            cp {input.regions} "$tmp/r.tsv"
+        fi
+        # match the contig naming of this file (first record)
+        first=$(bcftools query -f '%CHROM\n' "$v" 2>/dev/null | head -n1 || true)
+        if [[ "$first" == chr* ]]; then
+            awk 'BEGIN{{OFS="\t"}} {{print "chr"$1,$2}}' "$tmp/r.tsv" > "$tmp/r2.tsv"; mv "$tmp/r2.tsv" "$tmp/r.tsv"
+        fi
+        if [ ! -s "$tmp/r.tsv" ]; then
+            # no catalogue site on this chromosome: header-only part
+            bcftools view -h "$v" | bgzip > {output.vcf}
+        else
+            if [ -e "$v.tbi" ] || [ -e "$v.csi" ]; then
+                sel=(-R "$tmp/r.tsv" -T "$tmp/r.tsv")
+            else
+                echo "[app-pip] no index for $v; streaming the whole file (index it with 'bcftools index -t' to speed this up)" >&2
+                sel=(-T "$tmp/r.tsv")
+            fi
+            bcftools view "${{sel[@]}}" "$v" -Oz -o "$tmp/x.vcf.gz"
+            if ! bcftools view -h "$tmp/x.vcf.gz" | grep -c '^##contig=' > /dev/null; then
+                bcftools view -h "$tmp/x.vcf.gz" \
+                  | awk -v r="$tmp/r.tsv" 'BEGIN{{while((getline l < r)>0){{split(l,a,"\t"); if(!(a[1] in s)){{s[a[1]]=1; o[++n]=a[1]}}}}}}
+                         /^#CHROM/{{for(k=1;k<=n;k++) print "##contig=<ID="o[k]">"}} {{print}}' > "$tmp/h.txt"
+                bcftools reheader -h "$tmp/h.txt" -o "$tmp/y.vcf.gz" "$tmp/x.vcf.gz"
+                mv "$tmp/y.vcf.gz" "$tmp/x.vcf.gz"
+            fi
+            bcftools norm -m -any "$tmp/x.vcf.gz" -Oz -o {output.vcf}
+        fi
+        bcftools index -t -f {output.vcf}
+        """
+
+# ----------------------------------------------------------------------------
+# 2b. Merge the parts, then filter on minor allele frequency (computed from
+#     the genotypes; no bcftools plugins needed) and imputation R^2.
 # ----------------------------------------------------------------------------
 rule extract_snps:
     input:
-        vcf = wgs_inputs(),
+        parts = expand(f"{OUTDIR}/parts/{{part}}.vcf.gz", part=PARTS),
+        tbis  = expand(f"{OUTDIR}/parts/{{part}}.vcf.gz.tbi", part=PARTS),
         regions = rules.make_regions.output.tsv
     output:
         vcf = f"{OUTDIR}/app_snps.vcf.gz",
@@ -109,30 +169,7 @@ rule extract_snps:
     shell:
         r"""
         set -euo pipefail
-        tmp=$(mktemp -d)
-        trap 'rm -rf "$tmp"' EXIT
-        i=0
-        for v in {input.vcf}; do
-            i=$((i+1))
-            # match the contig naming of this file (first record; no index needed)
-            first=$(bcftools query -f '%CHROM\n' "$v" 2>/dev/null | head -n1 || true)
-            if [[ "$first" == chr* ]]; then
-                awk 'BEGIN{{OFS="\t"}} {{print "chr"$1,$2}}' {input.regions} > "$tmp/r.$i.tsv"
-            else
-                cp {input.regions} "$tmp/r.$i.tsv"
-            fi
-            if ! bcftools view -h "$v" | grep -c '^##contig=' > /dev/null; then
-                bcftools view -h "$v" \
-                  | awk -v r="$tmp/r.$i.tsv" 'BEGIN{{while((getline l < r)>0){{split(l,a,"\t"); if(!(a[1] in s)){{s[a[1]]=1; o[++n]=a[1]}}}}}}
-                         /^#CHROM/{{for(k=1;k<=n;k++) print "##contig=<ID="o[k]">"}} {{print}}' > "$tmp/h.$i.txt"
-                bcftools reheader -h "$tmp/h.$i.txt" -o "$tmp/in.$i.vcf.gz" "$v"
-                v="$tmp/in.$i.vcf.gz"
-            fi
-            bcftools view -T "$tmp/r.$i.tsv" "$v" -Ou \
-              | bcftools norm -m -any -Oz -o "$tmp/part.$i.vcf.gz"
-            bcftools index -t "$tmp/part.$i.vcf.gz"
-        done
-        bcftools concat -a "$tmp"/part.*.vcf.gz -Oz -o {output.raw}
+        bcftools concat -a {input.parts} -Oz -o {output.raw}
         bcftools index -t {output.raw}
 
         if ! bcftools view -h {output.raw} | grep -c '^##INFO=<ID={params.r2f},' > /dev/null; then

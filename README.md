@@ -124,8 +124,12 @@ app-pip/
 
 ## Processing notes
 
-- Variants are extracted at the exact catalogue positions; multi-allelic
-  records are split, and MAF is recomputed from the data before filtering.
+- Variants are extracted at the exact catalogue positions, one job per
+  chromosome file (these run in parallel with `--cores N`). If an input has a
+  `.tbi`/`.csi` index it is read by random access, which is much faster;
+  without an index the whole file is streamed (`bcftools index -t <file>`
+  once to avoid this). Multi-allelic records are split, and MAF is computed
+  from the genotypes before filtering (no bcftools plugins needed).
 - Variants lacking the imputation-quality INFO field (e.g. directly typed) are kept.
 - Allotype sites are matched on CHROM, POS, REF and ALT; a site with REF/ALT
   swapped in the input is matched and flipped. A missing call at any defining
